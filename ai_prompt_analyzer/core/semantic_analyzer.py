@@ -4,10 +4,17 @@ import asyncio
 import re
 from typing import Dict, List, Tuple, Set
 import numpy as np
-from sentence_transformers import SentenceTransformer
-from sklearn.cluster import KMeans
-from sklearn.feature_extraction.text import TfidfVectorizer
 from loguru import logger
+
+# Try to import ML libraries, fall back to basic functionality if not available
+try:
+    from sentence_transformers import SentenceTransformer
+    from sklearn.cluster import KMeans
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    ML_AVAILABLE = True
+except ImportError:
+    logger.warning("ML libraries not available. Some features will be limited.")
+    ML_AVAILABLE = False
 
 from ..models import AnalysisResult
 from .config import settings
@@ -19,12 +26,16 @@ class SemanticAnalyzer:
     def __init__(self):
         """Initialize the semantic analyzer."""
         self.embedding_model = None
-        self.tfidf_vectorizer = TfidfVectorizer(
-            max_features=1000,
-            stop_words='english',
-            ngram_range=(1, 3),
-            min_df=2
-        )
+        
+        if ML_AVAILABLE:
+            self.tfidf_vectorizer = TfidfVectorizer(
+                max_features=1000,
+                stop_words='english',
+                ngram_range=(1, 3),
+                min_df=2
+            )
+        else:
+            self.tfidf_vectorizer = None
         
         # Prompt engineering techniques patterns
         self.technique_patterns = {
@@ -137,14 +148,22 @@ class SemanticAnalyzer:
     
     async def initialize_models(self):
         """Initialize ML models asynchronously."""
+        if not ML_AVAILABLE:
+            logger.warning("ML models not available - using basic analysis")
+            return
+            
         if self.embedding_model is None:
             logger.info(f"Loading embedding model: {settings.embedding_model}")
             # Run in thread pool to avoid blocking
             loop = asyncio.get_event_loop()
-            self.embedding_model = await loop.run_in_executor(
-                None, SentenceTransformer, settings.embedding_model
-            )
-            logger.info("Embedding model loaded successfully")
+            try:
+                self.embedding_model = await loop.run_in_executor(
+                    None, SentenceTransformer, settings.embedding_model
+                )
+                logger.info("Embedding model loaded successfully")
+            except Exception as e:
+                logger.error(f"Failed to load embedding model: {e}")
+                self.embedding_model = None
     
     async def analyze_semantic_content(self, content: str) -> Dict[str, any]:
         """Analyze semantic content of a prompt.
@@ -194,8 +213,9 @@ class SemanticAnalyzer:
         Returns:
             Embeddings array
         """
-        if not self.embedding_model:
-            await self.initialize_models()
+        if not ML_AVAILABLE or not self.embedding_model:
+            # Return empty array if ML not available
+            return np.array([])
         
         try:
             loop = asyncio.get_event_loop()
@@ -477,6 +497,10 @@ class SemanticAnalyzer:
         Returns:
             Dictionary mapping cluster IDs to prompt indices
         """
+        if not ML_AVAILABLE:
+            # Simple fallback clustering by length
+            return self._simple_clustering(prompts, n_clusters)
+            
         if len(prompts) < n_clusters:
             # If fewer prompts than clusters, assign each to its own cluster
             return {i: [i] for i in range(len(prompts))}
@@ -486,7 +510,7 @@ class SemanticAnalyzer:
             embeddings = await self._generate_embeddings(prompts)
             
             if embeddings.size == 0:
-                return {0: list(range(len(prompts)))}
+                return self._simple_clustering(prompts, n_clusters)
             
             # Perform clustering
             loop = asyncio.get_event_loop()
@@ -505,4 +529,35 @@ class SemanticAnalyzer:
             
         except Exception as e:
             logger.error(f"Error clustering prompts: {e}")
-            return {0: list(range(len(prompts)))}
+            return self._simple_clustering(prompts, n_clusters)
+    
+    def _simple_clustering(self, prompts: List[str], n_clusters: int) -> Dict[int, List[int]]:
+        """Simple clustering fallback based on prompt length.
+        
+        Args:
+            prompts: List of prompt texts
+            n_clusters: Number of clusters
+            
+        Returns:
+            Dictionary mapping cluster IDs to prompt indices
+        """
+        if not prompts:
+            return {}
+            
+        # Sort by length and divide into clusters
+        indexed_prompts = [(i, len(prompt)) for i, prompt in enumerate(prompts)]
+        indexed_prompts.sort(key=lambda x: x[1])
+        
+        cluster_size = len(prompts) // n_clusters
+        clusters = {}
+        
+        for i in range(n_clusters):
+            start_idx = i * cluster_size
+            if i == n_clusters - 1:  # Last cluster gets remaining items
+                end_idx = len(indexed_prompts)
+            else:
+                end_idx = (i + 1) * cluster_size
+            
+            clusters[i] = [idx for idx, _ in indexed_prompts[start_idx:end_idx]]
+        
+        return clusters
